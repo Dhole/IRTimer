@@ -159,7 +159,7 @@ struct state {
   uint32_t rtcsv_last;
   enum screen screen;
   uint32_t timer_dur; // configured timer duration in minutes
-  uint32_t timer_dur_ms; // remaining timer duration in milliseconds
+  int32_t timer_dur_ms; // remaining timer duration in milliseconds
 };
 
 bool cookie_check(char cookie[4]) {
@@ -306,17 +306,13 @@ void countdown(struct state *state, uint8_t key_events) {
     state->screen = screen_menu_time;
   }
 
-  if (state->timer_dur_ms == 0) {
+  if (state->timer_dur_ms <= 0) {
     state->screen = screen_deadline;
   }
 
   ts1 = millis();
   elapsed = ts1 - ts0;
-  if (elapsed > state->timer_dur_ms) {
-    state->timer_dur_ms = 0;
-  } else {
-    state->timer_dur_ms -= elapsed;
-  }
+  state->timer_dur_ms -= elapsed;
   ts0 = ts1;
 
   draw_countdown(state->timer_dur_ms);
@@ -330,12 +326,11 @@ void deadline(struct state *state, uint8_t key_events) {
   u8g2_sendBuffer();
   delay(16);
 
-  irsend.sendSymphony(LightOff);
-  delay(200);
-  irsend.sendSymphony(LightOff);
-  delay(200);
-  irsend.sendSymphony(LightOff);
-  delay(200);
+  int i;
+  for (i = 0; i < 3; i++) {
+    irsend.sendSymphony(FanOff);
+    delay(200);
+  }
   state->screen = screen_sleep;
 }
 
@@ -421,14 +416,25 @@ void loop(void) {
 
   u8g2_begin();
 
+  const uint32_t SLEEP_TIME = 60; // in seconds
+
+  if (state.screen == screen_countdown) {
+    if (user_reset) {
+      state.timer_dur_ms -= (SLEEP_TIME/2) * 1000;
+    } else {
+      state.timer_dur_ms -= SLEEP_TIME * 1000;
+    }
+  }
+
   const uint32_t IDLE_SLEEP = 150; // 10 / 0.066
-  const int32_t frame_time_micros = 66666; // ~15 fps
+  const int32_t FRAME_TIME_MICROS = 66666; // ~15 fps
 
   uint8_t key_events;
   uint32_t idle = 0;
   uint32_t ts0 = micros();
   uint32_t ts1;
   int32_t delay_micros;
+  screen screen_prev = state.screen;
   while (true) {
     u8g2_clearBuffer();
     key_events = poll_btn_ev();
@@ -454,23 +460,26 @@ void loop(void) {
     }
 
     if (!user_reset) {
-      deep_sleep(&state, 60);
+      if (screen_prev != state.screen) {
+        continue;
+      }
+      deep_sleep(&state, SLEEP_TIME);
     }
 
     u8g2_sendBuffer();
 
     ts1 = micros();
-    delay_micros = frame_time_micros - (ts1 - ts0);
+    delay_micros = FRAME_TIME_MICROS - (ts1 - ts0);
     if (delay_micros < 0) {
       delay_micros = 0;
     }
-    delay(frame_time_micros / 1000);
+    delay(delay_micros / 1000);
     ts0 = ts1;
 
     if (key_events == 0) {
       idle++;
       if (idle >= IDLE_SLEEP) {
-        deep_sleep(&state, 60);
+        deep_sleep(&state, SLEEP_TIME);
       }
     } else {
       idle = 0;
