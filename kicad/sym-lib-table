@@ -1,0 +1,4 @@
+(sym_lib_table
+  (lib (name esp8266-lolin)(type Legacy)(uri ${KIPRJMOD}/esp8266-lolin.lib)(options "")(descr ""))
+  (lib (name ssd1306-128x64)(type Legacy)(uri ${KIPRJMOD}/ssd1306-128x64.lib)(options "")(descr ""))
+)
