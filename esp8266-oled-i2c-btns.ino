@@ -434,11 +434,12 @@ void loop(void) {
   uint32_t ts0 = micros();
   uint32_t ts1;
   int32_t delay_micros;
-  screen screen_prev = state.screen;
+  screen screen_prev;
   while (true) {
     u8g2_clearBuffer();
     key_events = poll_btn_ev();
 
+    screen_prev = state.screen;
     switch(state.screen) {
     case screen_menu_time:
       menu_time(&state, key_events);
