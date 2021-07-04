@@ -43,6 +43,12 @@ programmed IR signal).
 |:-:|:-:|:-:|
 | startup  | time menu  |  countdown |
 
+## Power consumption
+
+|![](./photos/ir_wakeup.jpeg)|![](./photos/ir_sleep.jpeg)|
+|:-:|:-:|
+| wakeup (31.2 mA) | sleep (2.07 mA) |
+
 # Schematic
 
 ![](./kicad/schematic.svg)
