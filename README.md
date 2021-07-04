@@ -47,6 +47,12 @@ programmed IR signal).
 
 ![](./kicad/schematic.svg)
 
+# Libraries used
+
+- [u8g2](https://github.com/olikraus/u8g2): graphics and display driver library.
+- [IRremoteESP8266](https://github.com/crankyoldgit/IRremoteESP8266): IR
+  library with a lot of supported protocols.
+
 # License
 
 GPLv3 (See [LICENSE.txt](LICENSE.txt))
