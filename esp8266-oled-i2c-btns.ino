@@ -19,11 +19,10 @@ enum code {
 };
 
 const uint16_t PIN_BTN_A   =  2; // D4
-const uint16_t PIN_BTN_B   = 13; // D7 
-const uint16_t PIN_BTN_C   =  0; // D3 // 16; // D0
-const uint16_t PIN_IR_LED  = 12;  // ESP8266 GPIO pin to use. 12 (D6).
+const uint16_t PIN_BTN_B   = 13; // D7
+const uint16_t PIN_BTN_C   =  0; // D3
+const uint16_t PIN_IR_LED  = 12;  // D6
 const uint16_t PIN_RST_ENABLE = 3; // RXD0
-const uint16_t PIN_WAKEUP_USER = 14; // TXD0
 
 enum event {
   event_press_a = 1 << 0,
@@ -33,9 +32,15 @@ enum event {
 
 uint32_t rtcsv_wakeup = RTCSV;
 uint32_t rtccv_wakeup = RTCCV;
-bool user_reset;
+bool user_reset; // Will be true when the user has triggered the reset.
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 IRsend irsend(PIN_IR_LED);
+
+//
+// Below are u8g2 function wrappers that only apply when user_reset is true.
+// This way, on RTC reset the display won't be used at all, but we don't need
+// to introduce conditionals in every state drawing routines.
+//
 
 bool u8g2_begin(void) {
   if (user_reset) {
@@ -83,19 +88,11 @@ void u8g2_sendBuffer() {
   }
 }
 
-bool wakeup_user;
-
 void setup(void) {
-  pinMode(PIN_WAKEUP_USER, INPUT);
-  if (digitalRead(PIN_WAKEUP_USER) == HIGH) {
-    wakeup_user = false;
-  } else {
-    wakeup_user = true;
-  }
   pinMode(PIN_BTN_A, INPUT_PULLUP);
   pinMode(PIN_BTN_B, INPUT_PULLUP);
-  // pinMode(PIN_BTN_C, INPUT_PULLDOWN_16);
   pinMode(PIN_BTN_C, INPUT_PULLUP);
+  // We disable the reset user button by "switching" the mosfet OFF.
   pinMode(PIN_RST_ENABLE, OUTPUT);
   digitalWrite(PIN_RST_ENABLE, LOW);
 }
@@ -112,6 +109,8 @@ bool poll_btn_c(void) {
   return !digitalRead(PIN_BTN_C);
 }
 
+// poll button events.  Return value contains a bit set when the corresponding
+// button was pressed down.
 uint8_t poll_btn_ev(void) {
   static bool btn_b = false;
   static bool btn_a = false;
@@ -146,6 +145,10 @@ uint8_t poll_btn_ev(void) {
   return events;
 }
 
+const uint32_t SLEEP_TIME_LONG = 600; // 10 minute
+const uint32_t SLEEP_TIME_SHORT = 60; // 1 minute
+
+// screen state
 enum screen {
   screen_menu_time,
   screen_countdown,
@@ -160,6 +163,7 @@ struct state {
   enum screen screen;
   uint32_t timer_dur; // configured timer duration in minutes
   int32_t timer_dur_ms; // remaining timer duration in milliseconds
+  uint32_t sleep_time; // scheduled time of last sleep in seconds
 };
 
 bool cookie_check(char cookie[4]) {
@@ -182,6 +186,7 @@ void state_init(struct state *s) {
   s->rtcsv_last = 0;
   s->timer_dur = 0;
   s->timer_dur_ms = 0;
+  s->sleep_time = SLEEP_TIME_LONG;
 }
 
 void state_read(struct state *s) {
@@ -197,6 +202,7 @@ void state_write(struct state *s) {
 
 const uint32_t DUR_MAX = 10 * 60;
 
+// Increment duration in minutes, in a non-linear way
 uint32_t dur_inc(uint32_t dur) {
   if (dur < 10) {
     return dur + 1;
@@ -213,6 +219,7 @@ uint32_t dur_inc(uint32_t dur) {
   }
 }
 
+// Decrement duration in minutes, in a non-linear way
 uint32_t dur_dec(uint32_t dur) {
   if (dur > 6 * 60) {
     return dur - 60;
@@ -229,6 +236,7 @@ uint32_t dur_dec(uint32_t dur) {
   }
 }
 
+// draw menu time screen
 // dur in minutes
 void draw_menu_time(uint32_t dur) {
   char line0[32];
@@ -238,16 +246,17 @@ void draw_menu_time(uint32_t dur) {
   sprintf(line0, "%02dh %02dm", hours, minutes);
   u8g2_setFont(u8g2_font_logisoso24_tf);
   u8g2_drawStr(0, 24, line0);
-  
+
   u8g2_setFont(u8g2_font_open_iconic_all_2x_t);
   u8g2_drawGlyph(128 / 6 * (1 + 0 * 2) - 5, 64, 116);
   u8g2_drawGlyph(128 / 6 * (1 + 1 * 2) - 5, 64, 119);
   u8g2_drawGlyph(128 / 6 * (1 + 2 * 2) - 5, 64, 120);
 }
 
-// A -> DEC
-// B -> INC
-// C -> OK
+// menu time screen
+// Button A -> DEC
+// Button B -> INC
+// Button C -> OK
 void menu_time(struct state *state, uint8_t key_events) {
   if (key_events & event_press_a) {
     state->timer_dur = dur_dec(state->timer_dur);
@@ -255,18 +264,15 @@ void menu_time(struct state *state, uint8_t key_events) {
     state->timer_dur = dur_inc(state->timer_dur);
   } else if (key_events & event_press_c) {
     state->timer_dur_ms = state->timer_dur * 60 * 1000;
-    // DBG BEGIN
-    if (state->timer_dur_ms == 0) {
-      state->timer_dur_ms = 4 * 1000;
-    }
-    // DBG END
+
     state->screen = screen_countdown;
   }
 
+  state->sleep_time = SLEEP_TIME_LONG;
   draw_menu_time(state->timer_dur);
 }
 
-
+// draw countdown screen
 // t in milliseconds
 void draw_countdown(uint32_t t) {
   char line0[32];
@@ -277,32 +283,29 @@ void draw_countdown(uint32_t t) {
   t /= 60;
   uint32_t minutes = t % 60;
   uint32_t hours = t / 60;
-  
+
   sprintf(line0, "%02dh %02dm", hours, minutes);
   u8g2_setFont(u8g2_font_logisoso24_tf);
   u8g2_drawStr(0, 24, line0);
-  
+
   sprintf(line1, "%02d.%03ds", seconds, milliseconds);
   u8g2_setFont(u8g2_font_logisoso16_tf);
   u8g2_drawStr(0, 24 + 16 + 2, line1);
 
   u8g2_setFont(u8g2_font_open_iconic_all_2x_t);
-  u8g2_drawGlyph(128 / 6 * (1 + 0 * 2) - 5, 64, 259);
+  // u8g2_drawGlyph(128 / 6 * (1 + 0 * 2) - 5, 64, 259);
   // u8g2_drawGlyph(128 / 6 * (1 + 1 * 2) - 5, 64, 0);
   u8g2_drawGlyph(128 / 6 * (1 + 2 * 2) - 5, 64, 121);
 }
 
-// A -> DISPLAY ON/OFF
-// C -> STOP
+// countdown screen
+// Button C -> STOP
 void countdown(struct state *state, uint8_t key_events) {
   static uint32_t ts0 = millis();
   uint32_t ts1;
   uint32_t elapsed;
-  bool display_on = true;
 
-  if (key_events & event_press_a) {
-    display_on = !display_on;
-  } else if (key_events & event_press_c) {
+  if (key_events & event_press_c) {
     state->screen = screen_menu_time;
   }
 
@@ -315,9 +318,16 @@ void countdown(struct state *state, uint8_t key_events) {
   state->timer_dur_ms -= elapsed;
   ts0 = ts1;
 
+  if (state->timer_dur_ms > SLEEP_TIME_LONG * 1000) {
+    state->sleep_time = SLEEP_TIME_LONG;
+  } else {
+    state->sleep_time = SLEEP_TIME_SHORT;
+  }
+
   draw_countdown(state->timer_dur_ms);
 }
 
+// deadline screen
 void deadline(struct state *state, uint8_t key_events) {
   irsend.begin();
   u8g2_clearBuffer();
@@ -331,13 +341,16 @@ void deadline(struct state *state, uint8_t key_events) {
     irsend.sendSymphony(FanOff);
     delay(200);
   }
+  state->sleep_time = SLEEP_TIME_LONG;
   state->screen = screen_sleep;
 }
 
+// sleep screen
 void sleep(struct state *state, uint8_t key_events) {
   state->screen = screen_menu_time;
 }
 
+// Show startup logo
 void show_logo(void) {
   int i = 0;
   for (i = 0; i < (64 / 2 + 24 / 2); i += 2) {
@@ -347,12 +360,15 @@ void show_logo(void) {
     u8g2_sendBuffer();
     delay(16);
   }
-  
-  delay(500);
+  u8g2_setFont(u8g2_font_logisoso16_tf);
+  u8g2_drawStr(50, 60, "by Dhole");
+  u8g2_sendBuffer();
+
+  delay(1000);
 }
 
-const uint32_t RTCSV_THRESHOLD = 7000;
-
+// Save state to RTC, turn off display, and enter deep sleep for seconds
+// duration.
 void deep_sleep(struct state *state, uint32_t seconds) {
   state_write(state);
   u8g2.setPowerSave(1);
@@ -360,69 +376,38 @@ void deep_sleep(struct state *state, uint32_t seconds) {
 }
 
 void loop(void) {
-  // WiFi.setSleepMode(WIFI_MODEM_SLEEP);
-  
-  // RTC Memory is 512 bytes
-  // char data[4];
-  // ESP.rtcUserMemoryRead(0, (uint32_t *) data, sizeof(data));
-
-  // u8g2.clearBuffer();
-  // u8g2.setFont(u8g2_font_logisoso16_tf);
-  // char line[32];
-  // sprintf(line, "%02x %02x %02x %02x", data[0], data[1], data[2], data[3]);
-  // u8g2.drawStr(0, 24, line);
-  // u8g2.sendBuffer();
-  // delay(5000);
-  // 
-  // data[0] = 0;
-  // data[1] = 1;
-  // data[2] = 2;
-  // data[3] = 3;
-  // ESP.rtcUserMemoryWrite(0, (uint32_t *) data, sizeof(data));
-  // u8g2.setPowerSave(1);
-
   struct state state;
   state_read(&state);
+  bool startup = false;
   if (state.rtcsv_last == 0) {
     user_reset = true;
     state.rtcsv_last = rtcsv_wakeup;
-    // state_write(&state);
-    // ESP.deepSleep(1e3, WAKE_RF_DISABLED);
+    startup = true;
   } else {
+    // When the user presses the reset button, RTCSV is slightly lower than
+    // when the reset is triggered by the RTC.  We use this to detect a user
+    // reset.  The RTCSV seems to increase slightly at every reboot, so we
+    // store the RTCSV value every time to use it for comparison in the next
+    // reset.
     user_reset = rtcsv_wakeup < (state.rtcsv_last - 10) ? true : false;
   }
-
-  // DBG BEGIN
-  // u8g2.clearBuffer();
-  // u8g2.setFont(u8g2_font_logisoso16_tf);
-  // char line[32];
-  // sprintf(line, "%c %c %c %c", state.cookie[0], state.cookie[1], state.cookie[2], state.cookie[3]);
-  // u8g2.drawStr(0, 16, line);
-  // rst_info* rinfo = ESP.getResetInfoPtr();
-  // sprintf(line, "%x %d %d", millis(), rinfo->reason, rtcsv_wakeup);
-  // u8g2.drawStr(0, 16 + 16 + 2, line);
-  // sprintf(line, "%d %d", rtccv_wakeup, user_reset);
-  // u8g2.drawStr(0, 16 + 16 + 2 + 16 + 2, line);
-  // u8g2.sendBuffer();
-  // delay(5000);
 
   if (!user_reset) {
     state.rtcsv_last = rtcsv_wakeup;
   }
-  // state_write(&state);
-  // u8g2.setPowerSave(1);
-  // ESP.deepSleep(600e6, WAKE_RF_DISABLED);
-  // DBG END
 
   u8g2_begin();
-
-  const uint32_t SLEEP_TIME = 60; // in seconds
+  if (startup) {
+    show_logo();
+  }
 
   if (state.screen == screen_countdown) {
     if (user_reset) {
-      state.timer_dur_ms -= (SLEEP_TIME/2) * 1000;
+      // On a user reset, we substract the average elapsed time.
+      state.timer_dur_ms -= (state.sleep_time/2) * 1000;
     } else {
-      state.timer_dur_ms -= SLEEP_TIME * 1000;
+      // On a RTC reset, we substract the programmed sleep time.
+      state.timer_dur_ms -= state.sleep_time * 1000;
     }
   }
 
@@ -440,6 +425,8 @@ void loop(void) {
     key_events = poll_btn_ev();
 
     screen_prev = state.screen;
+    // Evaluate a state transition, and draw display according to current
+    // screen.
     switch(state.screen) {
     case screen_menu_time:
       menu_time(&state, key_events);
@@ -462,13 +449,18 @@ void loop(void) {
 
     if (!user_reset) {
       if (screen_prev != state.screen) {
+        // In RTC reset, if there was a state transition do another loop
+        // iteration.  This is necessary because once the countdown reches to
+        // 0, we need to trigger the deadline without a reset in between.
         continue;
       }
-      deep_sleep(&state, SLEEP_TIME);
+      deep_sleep(&state, state.sleep_time);
     }
 
     u8g2_sendBuffer();
 
+    // Figure out how long to sleep in order to reach FRAME_TIME_MICROS
+    // duration for every frame.
     ts1 = micros();
     delay_micros = FRAME_TIME_MICROS - (ts1 - ts0);
     if (delay_micros < 0) {
@@ -477,48 +469,14 @@ void loop(void) {
     delay(delay_micros / 1000);
     ts0 = ts1;
 
+    // If there are no events for IDLE_SLEEP frames, go to sleep.
     if (key_events == 0) {
       idle++;
       if (idle >= IDLE_SLEEP) {
-        deep_sleep(&state, SLEEP_TIME);
+        deep_sleep(&state, state.sleep_time);
       }
     } else {
       idle = 0;
     }
   }
-
-
-  // ESP.deepSleep(5e6, WAKE_RF_DISABLED);
-  
-  show_logo();
-  // menu_time();
-
-  
-  // enum screen screen = screen_menu_time;
-  // uint32_t dur = 0;
-  // while (true) {
-  //   switch (screen) {
-  //   case screen_menu_time:
-  //     screen = menu_time(&dur);
-  //     break;
-  //   case screen_countdown:
-  //     screen = countdown(dur);
-  //     break;
-  //   case screen_deadline:
-  //     screen = deadline();
-  //     break;
-  //   case screen_sleep:
-  //     screen = sleep();
-  //     break;
-  //   default:
-  //     while (true) {
-  //       u8g2.clearBuffer();
-  //       u8g2.setFont(u8g2_font_logisoso16_tf);
-  //       u8g2.drawStr(0, 64/2 + 16/2, "Bad state");
-  //       u8g2.sendBuffer();
-  //       delay(16);
-  //     }
-  //     break;
-  //   }
-  // }
 }
